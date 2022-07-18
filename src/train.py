@@ -1,0 +1,386 @@
+# coding=utf-8
+import random
+
+from prototypical_batch_sampler import PrototypicalBatchSampler
+from prototypical_loss import prototypical_loss as loss_fn
+from nturgbd_dataset import NTU_RGBD_Dataset
+from protonet import ProtoNet
+from parser_util import get_parser
+from GMN.utils import getGMNmodel, getidx
+from utils import load_data, get_para_num, setup_seed
+
+from tqdm import tqdm
+import numpy as np
+import torch
+import pickle
+import os
+import time
+from tensorboardX import SummaryWriter
+import gl
+from utils import getAvaliableDevice
+
+
+def init_seed(opt):
+    '''
+    Disable cudnn to maximize reproducibility
+    '''
+    torch.cuda.cudnn_enabled = False
+    np.random.seed(opt.manual_seed)
+    torch.manual_seed(opt.manual_seed)
+    torch.cuda.manual_seed(opt.manual_seed)
+
+
+def init_dataset(opt, data_list, mode):
+    # print('not extract frame')
+    # opt.extract_frame = 0
+    debug = False
+    dataset = NTU_RGBD_Dataset(mode=mode, data_list=data_list, debug=debug, extract_frame=opt.extract_frame)
+    n_classes = len(np.unique(dataset.label))
+    if n_classes < opt.classes_per_it_tr or n_classes < opt.classes_per_it_val:
+        raise(Exception('There are not enough classes in the dataset in order ' +
+                        'to satisfy the chosen classes_per_it. Decrease the ' +
+                        'classes_per_it_{tr/val} option and try again.'))
+    return dataset
+
+
+def init_sampler(opt, labels, mode):
+    if 'train' in mode:
+        classes_per_it = opt.classes_per_it_tr
+        num_samples = opt.num_support_tr + opt.num_query_tr
+        iters = opt.train_iterations
+    else:
+        classes_per_it = opt.classes_per_it_val
+        num_samples = opt.num_support_val + opt.num_query_val
+        iters = opt.test_iterations
+
+    return PrototypicalBatchSampler(labels=labels,
+                                    classes_per_it=classes_per_it,
+                                    num_samples=num_samples,
+                                    iterations=iters)
+
+def init_dataloader(opt, data_list, mode):
+    dataset = init_dataset(opt, data_list, mode)
+    sampler = init_sampler(opt, dataset.label, mode)
+    dataloader = torch.utils.data.DataLoader(dataset, batch_sampler=sampler, num_workers=4)
+    return dataloader
+
+def init_protonet(opt):
+    '''
+    Initialize the ProtoNet
+    '''
+    model = ProtoNet(opt).to(gl.device)
+    if opt.model == 1:
+        model_path = os.path.join(opt.experiment_root, 'best_model.pth')
+        print('model_path', model_path)
+        model.load_state_dict(torch.load(model_path))
+    print(get_para_num(model))
+    return model
+
+def init_optim(opt, model):
+    '''
+    Initialize optimizer
+    '''
+
+    # optimizer = torch.optim.SGD(model.parameters(), lr=opt.learning_rate, momentum=0.9, weight_decay=5e-4, nesterov=True)
+    optimizer = torch.optim.Adam(params=model.parameters(), lr=opt.learning_rate, weight_decay=5e-4)
+
+    return optimizer
+
+def init_lr_scheduler(opt, optim):
+    '''
+    Initialize the learning rate scheduler
+    '''
+    if opt.lr_flag == 'reduceLR':
+        lr_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optim, mode='min', factor=0.5, patience=10, verbose=True, min_lr=1e-6)
+    elif opt.lr_flag == 'stepLR':
+        lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer=optim, gamma=opt.lr_scheduler_gamma,
+                                                       step_size=opt.lr_scheduler_step)
+
+    return lr_scheduler
+
+def save_list_to_file(path, thelist):
+    with open(path, 'w') as f:
+        for item in thelist:
+            f.write("%s\n" % item)
+
+def save_file(opt, train_acc, val_acc, train_loss, val_loss):
+    train_acc_file = os.path.join(opt.experiment_root, 'train_acc.txt')
+    val_acc_file = os.path.join(opt.experiment_root, 'val_acc.txt')
+    train_loss_file = os.path.join(opt.experiment_root, 'train_loss.txt')
+    val_loss_file = os.path.join(opt.experiment_root, 'val_loss.txt')
+    with open(train_acc_file, 'a') as f:
+        for item in train_acc:
+            f.write("%s\n" % item)
+
+    with open(val_acc_file, 'a') as f:
+        for item in val_acc:
+            f.write("%s\n" % item)
+
+    with open(train_loss_file, 'a') as f:
+        for item in train_loss:
+            f.write("%s\n" % item)
+
+    with open(val_loss_file, 'a') as f:
+        for item in val_loss:
+            f.write("%s\n" % item)
+
+def train(opt, tr_dataloader, model, optim, lr_scheduler, val_dataloader=None, test_dataloader=None):
+    '''
+    Train the model with the prototypical learning algorithm
+    '''
+    import json
+    with open(os.path.join(opt.experiment_root, 'opt.json'), 'w') as f:
+        j = vars(opt)
+        json.dump(j, f)
+        f.write('\n')
+
+    if val_dataloader is None:
+        best_state = None
+
+    best_acc = 0
+    start_epoch = 0
+    patience = 0
+
+    best_model_path = os.path.join(opt.experiment_root, 'best_model.pth')
+    last_model_path = os.path.join(opt.experiment_root, 'last_model.pth')
+    trace_file = os.path.join(opt.experiment_root, 'trace.txt')
+
+    from vatloss import VATLoss
+    vat_loss = VATLoss(xi=opt.xi, eps=opt.eps, ip=opt.ip)
+
+
+    for epoch in range(start_epoch, opt.epochs):
+        gl.epoch = epoch
+        gl.iter = 0
+        # print('=== Epoch: {} ==='.format(epoch))
+        tr_iter = iter(tr_dataloader)
+        model.train()
+        lr = opt.learning_rate
+        train_acc = []
+        reg_loss = []
+        train_loss = []
+        lds_loss = []
+
+        # for batch in tr_iter:
+        for batch in (tr_iter):
+            optim.zero_grad()
+            gl.mod = 'train'
+            x, y, sample_name = batch
+            x, y = x.to(gl.device).float(), y.to(gl.device)
+            model_output = model(x)
+            loss, acc, reg, batch_loss = model.loss(model_output, y, opt.num_support_tr, dtw=opt.dtw)
+
+            if opt.vat > 0:
+                lds = vat_loss(model, model_output, y, batch_loss)
+                loss = loss + lds * opt.alpha
+                lds_loss.append((lds * opt.alpha).item())
+
+            train_loss.append(loss.item())
+            train_acc.append(acc.item())
+            reg_loss.append(reg.item())
+
+            loss.backward()
+            optim.step()
+
+        avg_loss = np.mean(train_loss)
+        avg_reg = np.mean(reg_loss)
+        avg_acc = np.mean(train_acc)
+        avg_lds_loss = np.mean(lds_loss)
+
+        classfier_loss = avg_loss - avg_lds_loss
+
+        if opt.reg > 0:
+            string = 'train loss:{}, classfier loss:{} reg loss:{}, train Acc:{}'.format(avg_loss, avg_loss - avg_reg, avg_reg, avg_acc)
+        elif opt.vat > 0 :
+            string = 'train loss:{}, classfier loss:{}, lds loss:{}, train Acc:{}'.format(avg_loss, classfier_loss,avg_lds_loss,avg_acc)
+        else:
+            string = 'train loss:{}, train Acc:{}'.format(avg_loss, avg_acc)
+
+        if opt.lr_flag == 'reduceLR':
+            lr_scheduler.step(avg_loss)
+        elif opt.lr_flag == 'stepLR':
+            lr_scheduler.step()
+
+        lr = optim.state_dict()['param_groups'][0]['lr']
+
+        if val_dataloader is None:
+            continue
+        val_iter = iter(val_dataloader)
+
+        model.eval()
+
+        val_loss = []
+        val_acc = []
+
+        # for batch in val_iter:
+        for batch in (val_iter):
+            x, y, sample_name = batch
+            x, y = x.to(gl.device).float(), y.to(gl.device)
+            gl.mod = 'val'
+            model_output = model(x)
+            loss, acc, reg, _ = model.loss(model_output, target=y, n_support=opt.num_support_val, dtw=opt.dtw)
+            val_loss.append(loss.item())
+            val_acc.append(acc.item())
+
+        avg_loss = np.mean(val_loss)
+        avg_acc = np.mean(val_acc)
+
+        postfix = ' (Best)' if avg_acc >= best_acc else ' (Best: {})'.format(best_acc)
+        string_val = 'val loss: {}, val acc: {}{} lr:{}'.format(avg_loss, avg_acc, postfix, lr)
+        # print(string + '\t' + string_val)
+        with open(trace_file, 'a') as f:
+            f.write(string + '\t' + string_val + '\n')
+        # save_file(opt, train_acc, val_acc, train_loss, val_loss)
+
+        if avg_acc >= best_acc:
+            torch.save(model.state_dict(), best_model_path)
+            best_acc = avg_acc
+            best_state = model.state_dict()
+            patience = 0
+        else:
+            patience += 1
+        if patience > 70 or classfier_loss < 0.1:
+            break
+
+        # if epoch % 10 == 0 and epoch != 0:
+        #      test(opt=opt, test_dataloader=test_dataloader, model=model)
+
+    torch.save(model.state_dict(), last_model_path)
+
+    return best_state, best_acc
+
+def test(opt, test_dataloader, model):
+    '''
+    Test the model trained with the prototypical learning algorithm
+    '''
+
+    avg_acc = list()
+    trace_file = os.path.join(opt.experiment_root, 'test.txt')
+
+    for epoch in range(10):
+        # print('=== Epoch: {} ==='.format(epoch))
+        model.eval()
+
+        gl.epoch = epoch
+        gl.iter = 0
+        gl.mod = 'test'
+
+        test_iter = iter(test_dataloader)
+        for batch in test_iter:
+            x, y, sample_name = batch
+            x, y = x.to(gl.device).float(), y.to(gl.device)
+            model_output = model(x)
+            _, acc, _, _ = model.loss(model_output, target=y, n_support=opt.num_support_val, dtw=opt.dtw)
+            avg_acc.append(acc.item())
+
+        # print('avg_acc', np.mean(avg_acc))
+
+    avg_acc = np.mean(avg_acc)
+    with open(trace_file, 'a') as f:
+        f.write('test acc: {}\n'.format(avg_acc))
+    # print('Test Acc: {}'.format(avg_acc))
+
+    return avg_acc
+
+
+def eval(opt):
+    '''
+    Initialize everything and train
+    '''
+    options = get_parser().parse_args()
+
+    if torch.cuda.is_available() and not options.cuda:
+        print("WARNING: You have a CUDA device, so you should probably run with --cuda")
+
+    init_seed(options)
+    test_dataloader = init_dataset(options)[-1]
+    model = init_protonet(options)
+    model_path = os.path.join(opt.experiment_root, 'best_model.pth')
+    model.load_state_dict(torch.load(model_path))
+
+    test(opt=options,
+         test_dataloader=test_dataloader,
+         model=model)
+
+def main():
+    '''
+    Initialize everything and train
+    '''
+    options = get_parser().parse_args()
+    if options.debug == 1:
+        gl.debug = True
+    options.cuda = True
+    options.device = str(getAvaliableDevice(gpu=[3], left=False, min_mem=24000))
+
+    device = 'cuda:{}'.format(options.device) if torch.cuda.is_available() and options.cuda else 'cpu'
+    gl.device = device
+
+    gl.gamma = options.gamma
+    options.experiment_root = "../log/" + options.experiment_root
+    gl.experiment_root = options.experiment_root
+    gl.leave_all_frame = options.leave_all_frame
+    gl.reg_rate = options.reg
+    gl.backbone = options.backbone
+    gl.dataset = options.dataset
+    gl.use_attention = options.use_attention
+    gl.use_bias = options.use_bias
+    gl.run_mode = options.mode
+    gl.n_class = options.classes_per_it_tr
+    gl.shot = options.num_support_tr
+    gl.n_query = options.num_query_tr
+    gl.dtw = options.dtw
+    gl.eps = options.eps
+    gl.num = options.num
+
+    if not os.path.exists(options.experiment_root):
+        os.makedirs(options.experiment_root)
+
+    if torch.cuda.is_available() and not options.cuda:
+        print("WARNING: You have a CUDA device, so you should probably run with --cuda")
+
+    init_seed(options)
+    setup_seed(options.manual_seed)
+
+    data_list = []
+
+    tr_dataloader = init_dataloader(options, data_list, 'train')
+    val_dataloader = init_dataloader(options, data_list, 'val')
+    test_dataloader = init_dataloader(options, data_list, 'test')
+
+    model = init_protonet(options)
+    optim = init_optim(options, model)
+    lr_scheduler = init_lr_scheduler(options, optim)
+
+    # if 'erbao' in options.dataset:
+
+
+    if options.mode == 'train':
+        res = train(opt=options,
+                    tr_dataloader=tr_dataloader,
+                    val_dataloader=val_dataloader,
+                    test_dataloader=test_dataloader,
+                    model=model,
+                    optim=optim,
+                    lr_scheduler=lr_scheduler)
+        best_state, best_acc = res
+        print('Testing with last model..')
+        test(opt=options,
+             test_dataloader=test_dataloader,
+             model=model)
+
+        model.load_state_dict(best_state)
+        model_path = os.path.join(options.experiment_root, 'best_model.pth')
+        model.load_state_dict(torch.load(model_path))
+        print('Testing with best model..')
+        test(opt=options,
+             test_dataloader=test_dataloader,
+             model=model)
+    elif options.mode == 'test':
+        print('Testing with best model..')
+        test(opt=options,
+             test_dataloader=test_dataloader,
+             model=model)
+
+
+if __name__ == '__main__':
+    main()
